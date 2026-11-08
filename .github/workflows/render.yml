@@ -1,0 +1,346 @@
+name: Render Remotion (dipicu bot)
+
+# Taruh di repo PUBLIC render: .github/workflows/render.yml
+# Secret repo: TG_BOT_TOKEN dan DEST_KEY (string acak panjang; sama persis dengan DEST_KEY di .env bot)
+#
+# Desain keamanan (repo public, zip orang lain = kode tak tepercaya):
+#   job "render"  -> menjalankan kode dari zip, TIDAK punya secret apa pun, izin cuma baca
+#   job "kirim"   -> punya TG_BOT_TOKEN tapi tidak menjalankan kode dari zip, hanya mengirim file hasil
+#   tujuan Telegram (chat_id + reply_to) dienkripsi bot, jadi tidak terlihat publik di tab Actions
+
+run-name: render ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:     { description: "ref:<branch> atau link zip", required: true, type: string }
+      dest:        { description: "Tujuan Telegram (terenkripsi oleh bot)", required: true, type: string }
+      tag:         { description: "Penanda run (acak, dibuat bot)", required: true, type: string }
+      comp:        { description: "ID komposisi (kosong = otomatis kalau cuma satu)", required: false, type: string, default: "" }
+      scale:       { description: "Skala hasil, 1 = penuh", required: false, type: string, default: "1" }
+      frames:      { description: "Rentang frame, contoh 0-299 (kosong = semua)", required: false, type: string, default: "" }
+      still:       { description: "Nomor frame untuk gambar diam (kosong = render video)", required: false, type: string, default: "" }
+      props:       { description: "Props JSON (kosong = deteksi otomatis voice/music)", required: false, type: string, default: "" }
+      format:      { description: "mp4 | webm | gif", required: false, type: string, default: "mp4" }
+      keep_config: { description: "true = remotion.config.* tidak disentuh", required: false, type: string, default: "false" }
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  render:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    env:
+      ZIP_URL: ${{ inputs.zip_url }}
+      IN_COMP: ${{ inputs.comp }}
+      IN_SCALE: ${{ inputs.scale }}
+      IN_FRAMES: ${{ inputs.frames }}
+      IN_STILL: ${{ inputs.still }}
+      IN_PROPS: ${{ inputs.props }}
+      IN_FORMAT: ${{ inputs.format }}
+      KEEP_CONFIG: ${{ inputs.keep_config }}
+    steps:
+      - name: Periksa input
+        id: zr
+        run: |
+          : > "$GITHUB_WORKSPACE/run.log"
+          fail() { echo "$1" | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1; }
+          [[ "$IN_COMP" =~ ^[A-Za-z0-9_-]*$ ]] || fail "Nama komposisi tidak valid."
+          [[ "$IN_SCALE" =~ ^(1|0?\.[0-9]+)$ ]] || fail "Skala tidak valid."
+          [[ "$IN_FRAMES" =~ ^([0-9]+-[0-9]+)?$ ]] || fail "Format frames harus A-B."
+          [[ "$IN_STILL" =~ ^[0-9]*$ ]] || fail "Nomor frame tidak valid."
+          [[ "$IN_FORMAT" =~ ^(mp4|webm|gif)$ ]] || fail "Format harus mp4, webm, atau gif."
+          [[ ${#IN_PROPS} -le 4000 ]] || fail "Props terlalu panjang."
+          if [ -n "$IN_PROPS" ]; then printf '%s' "$IN_PROPS" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null || fail "Props bukan JSON valid."; fi
+          case "$ZIP_URL" in
+            ref:*) B="${ZIP_URL#ref:}"; [[ "$B" =~ ^job-[A-Za-z0-9]+$ ]] || fail "Nama branch tidak valid."; echo "branch=$B" >> "$GITHUB_OUTPUT" ;;
+            https://*) echo "branch=" >> "$GITHUB_OUTPUT" ;;
+            *) fail "Sumber zip tidak valid." ;;
+          esac
+
+      - name: Ambil zip dari branch job
+        if: ${{ steps.zr.outputs.branch != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.zr.outputs.branch }}
+          path: jobdata
+          persist-credentials: false
+
+      - name: Siapkan dan ekstrak zip
+        run: |
+          mkdir -p work
+          if [ "${ZIP_URL#ref:}" != "$ZIP_URL" ]; then
+            cp jobdata/job.zip "$RUNNER_TEMP/proj.zip" 2>&1 | tee -a run.log
+          else
+            curl -fsSL --retry 3 --max-filesize 104857600 -A "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36" -e "https://top4top.io/" -o "$RUNNER_TEMP/proj.zip" "$ZIP_URL" 2>&1 | tee -a run.log
+          fi
+          unzip -tq "$RUNNER_TEMP/proj.zip" >/dev/null 2>&1 || { echo "File yang terunduh bukan zip valid (link host rusak / diblokir / kadaluarsa)." | tee -a run.log; exit 1; }
+          unzip -q -o "$RUNNER_TEMP/proj.zip" -d work 2>&1 | tee -a run.log
+          rm -rf work/__MACOSX
+          PJ=$(find work -name package.json -not -path '*/node_modules/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$PJ" ]; then echo "package.json tidak ada di zip. Ini bukan proyek Remotion?" | tee -a run.log; exit 1; fi
+          echo "PROJ=$GITHUB_WORKSPACE/$(dirname "$PJ")" >> "$GITHUB_ENV"
+          echo "Proyek: $(dirname "$PJ")" | tee -a run.log
+
+      - name: Cek versi Node
+        id: nv
+        run: |
+          cd "$PROJ"
+          V=""
+          [ -f .nvmrc ] && V=$(tr -dc '0-9.' < .nvmrc | cut -d. -f1)
+          if [ -z "$V" ]; then V=$(node -e "try{const e=(require('./package.json').engines||{}).node||'';const m=e.match(/(\d+)/);console.log(m?m[1]:'')}catch{console.log('')}"); fi
+          case "$V" in 16|18|20|22|24) ;; *) V=20 ;; esac
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nv.outputs.v }}
+
+      - name: Pasang library Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libnss3 libdbus-1-3 libatk1.0-0 libasound2 libxrandr2 libxkbcommon-dev \
+            libxfixes3 libxcomposite1 libxdamage1 libgbm-dev libatk-bridge2.0-0 libcups2 libpango-1.0-0 libcairo2 \
+            fonts-noto-color-emoji fonts-liberation 2>&1 | tail -3
+
+      # kunci cache harus persis sama (tanpa restore-keys) supaya cache hasil proyek lain tidak bisa "nyasar" ke proyek ini
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('work/**/package.json') }}
+
+      - name: Bersihkan config bawaan Termux
+        run: |
+          cd "$PROJ"
+          if [ "$KEEP_CONFIG" != "true" ]; then
+            for f in remotion.config.ts remotion.config.js remotion.config.mjs; do
+              [ -f "$f" ] || continue
+              if grep -Eq 'setBrowserExecutable|setChromiumOpenGlRenderer|setConcurrency' "$f"; then
+                echo "Dihapus dari $f:" | tee -a "$GITHUB_WORKSPACE/run.log"
+                grep -E 'setBrowserExecutable|setChromiumOpenGlRenderer|setConcurrency' "$f" | tee -a "$GITHUB_WORKSPACE/run.log"
+                sed -i -E '/setBrowserExecutable|setChromiumOpenGlRenderer|setConcurrency/d' "$f"
+              fi
+            done
+          fi
+
+      - name: Pasang paket
+        run: |
+          cd "$PROJ"
+          {
+            if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && (pnpm install --frozen-lockfile || pnpm install)
+            elif [ -f yarn.lock ]; then yarn install --frozen-lockfile || yarn install
+            else npm install --no-audit --no-fund --legacy-peer-deps || npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
+            fi
+          } 2>&1 | tee -a "$GITHUB_WORKSPACE/run.log"
+          test -x node_modules/.bin/remotion || { echo "Remotion CLI tidak terpasang. Pastikan ada dependency @remotion/cli." | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1; }
+
+      - name: Cari entry dan komposisi
+        run: |
+          cd "$PROJ"
+          cat > "$RUNNER_TEMP/detect.js" <<'EOF'
+          const fs = require('fs'), path = require('path');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          let entry = null;
+          const sc = Object.values(pkg.scripts || {}).join('\n');
+          const m = sc.match(/remotion\s+(?:render|studio|bundle|compositions|still|preview)\s+(?:--[\w-]+(?:=\S+)?\s+)*([^\s-]\S*\.[cm]?[jt]sx?)/);
+          if (m && fs.existsSync(m[1])) entry = m[1];
+          if (!entry) for (const c of ['src/index.ts','src/index.tsx','src/index.js','src/index.jsx','index.ts','index.tsx','index.js','index.jsx','src/entry.ts','src/entry.tsx']) if (fs.existsSync(c)) { entry = c; break; }
+          if (!entry) {
+            const walk = (d, depth) => {
+              if (depth > 4 || entry) return;
+              for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+                if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+                const p = path.join(d, e.name);
+                if (e.isDirectory()) walk(p, depth + 1);
+                else if (/\.[cm]?[jt]sx?$/.test(e.name) && /registerRoot\s*\(/.test(fs.readFileSync(p, 'utf8'))) { entry = p; return; }
+              }
+            };
+            walk('.', 0);
+          }
+          console.log(entry || '');
+          EOF
+          ENTRY=$(node "$RUNNER_TEMP/detect.js")
+          if [ -z "$ENTRY" ]; then echo "File entry Remotion (registerRoot) tidak ketemu." | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1; fi
+          echo "ENTRY=$ENTRY" >> "$GITHUB_ENV"
+          echo "Entry: $ENTRY" | tee -a "$GITHUB_WORKSPACE/run.log"
+
+          npx remotion compositions "$ENTRY" --timeout=120000 2>&1 | tee "$RUNNER_TEMP/comps.txt" >> "$GITHUB_WORKSPACE/run.log" || true
+          sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/comps.txt" | awk 'NF>=4 && $3 ~ /^[0-9]+x[0-9]+$/ {print $1, $4}' > "$RUNNER_TEMP/comps.list"
+          IDS=$(awk '{print $1}' "$RUNNER_TEMP/comps.list")
+          COMP="$IN_COMP"
+          if [ -z "$COMP" ]; then
+            N=$(printf '%s\n' "$IDS" | grep -c . || true)
+            if [ "$N" = "1" ]; then COMP="$IDS"
+            else echo "Komposisi ada $N: $(printf '%s' "$IDS" | tr '\n' ' '). Pilih satu: /render NamaKomposisi" | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1; fi
+          elif ! printf '%s\n' "$IDS" | grep -qx "$COMP"; then
+            echo "Komposisi \"$COMP\" tidak ada. Yang tersedia: $(printf '%s' "$IDS" | tr '\n' ' ')" | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1
+          fi
+          echo "COMP=$COMP" >> "$GITHUB_ENV"
+          echo "Komposisi: $COMP" | tee -a "$GITHUB_WORKSPACE/run.log"
+
+          # estimasi waktu (tanpa batas frame): tolak kalau diperkirakan lewat 85 menit, supaya tidak mati di tengah jalan
+          TOTAL=$(awk -v c="$COMP" '$1==c {print $2}' "$RUNNER_TEMP/comps.list" | head -1)
+          if [ -z "$IN_STILL" ] && [[ "$TOTAL" =~ ^[0-9]+$ ]]; then
+            N=$TOTAL
+            if [[ "$IN_FRAMES" =~ ^([0-9]+)-([0-9]+)$ ]]; then N=$(( BASH_REMATCH[2] - BASH_REMATCH[1] + 1 )); fi
+            EST=$(awk -v n="$N" -v s="${IN_SCALE:-1}" 'BEGIN{printf "%d", n*0.55*s*s/60 + 1}')
+            echo "Perkiraan render: $N frame, ±${EST} menit" | tee -a "$GITHUB_WORKSPACE/run.log"
+            if [ "$EST" -gt 85 ]; then
+              echo "Perkiraan render ±${EST} menit, melebihi batas 85 menit. Coba resolusi lebih kecil (720p/540p) atau frames=A-B." | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1
+            fi
+          fi
+
+      - name: Render
+        run: |
+          cd "$PROJ"
+          mkdir -p out
+          PROPS="$IN_PROPS"
+          if [ -z "$PROPS" ]; then
+            PROPS='{}'
+            if [ -f public/voice.mp3 ] && [ -f public/music.mp3 ]; then PROPS='{"voice":"voice.mp3","music":"music.mp3"}'
+            elif [ -f public/voice.mp3 ]; then PROPS='{"voice":"voice.mp3","music":""}'
+            elif [ -f public/music.mp3 ]; then PROPS='{"voice":"","music":"music.mp3"}'; fi
+          fi
+          echo "props: $PROPS" | tee -a "$GITHUB_WORKSPACE/run.log"
+          START=$(date +%s)
+          if [ -n "$IN_STILL" ]; then
+            OUT=out/still.png
+            npx remotion still "$ENTRY" "$COMP" "$OUT" --frame="$IN_STILL" --scale="${IN_SCALE:-1}" --props="$PROPS" --overwrite --timeout=120000 2>&1 | tee -a "$GITHUB_WORKSPACE/run.log"
+          else
+            case "$IN_FORMAT" in gif) EXT=gif; CODEC="--codec=gif";; webm) EXT=webm; CODEC="--codec=vp8";; *) EXT=mp4; CODEC="";; esac
+            OUT="out/video.$EXT"
+            FR=""; [ -n "$IN_FRAMES" ] && FR="--frames=$IN_FRAMES"
+            npx remotion render "$ENTRY" "$COMP" "$OUT" $CODEC $FR --scale="${IN_SCALE:-1}" --props="$PROPS" --concurrency="$(nproc)" --overwrite --timeout=120000 2>&1 | tr '\r' '\n' | tee -a "$GITHUB_WORKSPACE/run.log"
+          fi
+          test -s "$OUT" || { echo "Hasil render kosong." | tee -a "$GITHUB_WORKSPACE/run.log"; exit 1; }
+          echo "OUT=$PROJ/$OUT" >> "$GITHUB_ENV"
+          echo "DUR=$(( $(date +%s) - START ))" >> "$GITHUB_ENV"
+
+      - name: Siapkan hasil dan metadata
+        run: |
+          LIMIT=51380224   # 49 MB, batas upload bot Telegram ~50 MB
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          probe() {
+            W=""; H=""; D=""
+            if command -v ffprobe >/dev/null; then
+              W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$OUT" 2>/dev/null | head -1)
+              H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$OUT" 2>/dev/null | head -1)
+              D=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$OUT" 2>/dev/null | head -1 | cut -d. -f1)
+            fi
+          }
+          probe
+          SIZE=$(stat -c%s "$OUT")
+          NOTE=""
+          # hasil kegedean: kecilkan otomatis (khusus mp4)
+          if [ "$SIZE" -gt "$LIMIT" ] && [ -z "$IN_STILL" ] && [ "${OUT##*.}" = "mp4" ] && [[ "$D" =~ ^[0-9]+$ ]] && [ "$D" -gt 0 ]; then
+            VBR=$(( 44 * 1048576 * 8 / D - 128000 ))
+            if [ "$VBR" -ge 150000 ]; then
+              echo "Hasil $((SIZE/1048576)) MB kegedean, dikecilkan (bitrate $((VBR/1000))k)" | tee -a "$GITHUB_WORKSPACE/run.log"
+              ffmpeg -y -loglevel error -i "$OUT" -c:v libx264 -b:v "$VBR" -maxrate "$((VBR*13/10))" -bufsize "$((VBR*2))" \
+                -preset veryfast -c:a aac -b:a 128k -movflags +faststart "$PROJ/out/fit.mp4" 2>&1 | tee -a "$GITHUB_WORKSPACE/run.log"
+              if [ -s "$PROJ/out/fit.mp4" ]; then OUT="$PROJ/out/fit.mp4"; SIZE=$(stat -c%s "$OUT"); NOTE="Dikecilkan otomatis supaya muat di Telegram."; fi
+            fi
+          fi
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "Hasil $((SIZE/1048576)) MB, kegedean buat bot Telegram (maks 49 MB) dan tidak bisa dikecilkan otomatis. Coba resolusi lebih kecil (720p/540p) atau frames=A-B." | tee -a "$GITHUB_WORKSPACE/run.log"
+            exit 1
+          fi
+          EXT="${OUT##*.}"
+          cp "$OUT" "$GITHUB_WORKSPACE/result/file.$EXT"
+          {
+            echo "COMP=${COMP}"
+            echo "W=${W}"
+            echo "H=${H}"
+            echo "D=${D}"
+            echo "SIZE=${SIZE}"
+            echo "DUR=${DUR}"
+            echo "STILL=${IN_STILL:+1}"
+            echo "NOTE=${NOTE}"
+          } > "$GITHUB_WORKSPACE/result/meta.txt"
+
+      - name: Simpan log dan hasil untuk job kirim
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          tail -c 1500 "$GITHUB_WORKSPACE/run.log" > "$GITHUB_WORKSPACE/result/tail.txt" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: result
+          path: result
+          if-no-files-found: ignore
+          retention-days: 1
+
+  kirim:
+    needs: render
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      DEST_KEY: ${{ secrets.DEST_KEY }}
+      DEST: ${{ inputs.dest }}
+      RENDER_RESULT: ${{ needs.render.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: result
+          path: result
+
+      - name: Kirim ke Telegram
+        run: |
+          [ "$RENDER_RESULT" = "cancelled" ] && exit 0
+          API="https://api.telegram.org/bot${TG_BOT_TOKEN}"
+          PLAIN=$(printf %s "$DEST" | base64 -d 2>/dev/null | openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -pass env:DEST_KEY 2>/dev/null || true)
+          if ! [[ "$PLAIN" =~ ^(-?[0-9]+)\|([0-9]*)$ ]]; then echo "Tujuan Telegram tidak bisa dibaca (DEST_KEY beda dengan di bot?)"; exit 1; fi
+          CHAT_ID="${BASH_REMATCH[1]}"; REPLY_TO="${BASH_REMATCH[2]}"
+          RT=(); [ -n "$REPLY_TO" ] && RT=(-F "reply_to_message_id=$REPLY_TO" -F "allow_sending_without_reply=true")
+
+          gagal() {
+            TAIL=""
+            [ -f result/tail.txt ] && TAIL=$(tail -c 1200 result/tail.txt | LC_ALL=C tr -cd '[:print:]\n')
+            curl -s -X POST "$API/sendMessage" -F "chat_id=$CHAT_ID" "${RT[@]}" \
+              -F "text=❌ Render di GitHub Actions gagal.
+
+          ${TAIL:-Log tidak tersedia, buka: $RUN_URL}" > /dev/null || true
+            exit 1
+          }
+
+          [ "$RENDER_RESULT" = "success" ] || gagal
+          F=$(ls result/file.* 2>/dev/null | head -1)
+          [ -n "$F" ] && [ -f "$F" ] || gagal
+          EXT="${F##*.}"
+          case "$EXT" in mp4|webm|gif|png) ;; *) gagal ;; esac
+          SIZE=$(stat -c%s "$F")
+          [ "$SIZE" -le 51380224 ] || gagal
+
+          # metadata dari job render dianggap tak tepercaya: hanya karakter aman yang diambil
+          val() { grep -m1 "^$1=" result/meta.txt 2>/dev/null | cut -d= -f2- | LC_ALL=C tr -cd 'A-Za-z0-9_ .,:()-' | head -c 120; }
+          COMP=$(val COMP); W=$(val W); H=$(val H); D=$(val D); DUR=$(val DUR); NOTE=$(val NOTE); STILL=$(val STILL)
+          MB=$(awk "BEGIN{printf \"%.2f\", $SIZE/1048576}")
+          CAP="🎬 ${COMP}"
+          [ -n "$W" ] && [ -n "$H" ] && CAP="$CAP
+          📐 ${W}x${H}"
+          [[ "$D" =~ ^[0-9]+$ ]] && CAP="$CAP · ⏱ ${D}s"
+          CAP="$CAP
+          💾 ${MB} MB"
+          [[ "$DUR" =~ ^[0-9]+$ ]] && CAP="$CAP · render $((DUR/60))m$((DUR%60))s (GitHub Actions)"
+          [ -n "$NOTE" ] && CAP="$CAP
+          ⚠️ $NOTE"
+
+          if [ "$STILL" = "1" ] || [ "$EXT" = "png" ] || [ "$EXT" = "webm" ]; then METHOD=sendDocument; FIELD=document
+          elif [ "$EXT" = "gif" ]; then METHOD=sendAnimation; FIELD=animation
+          else METHOD=sendVideo; FIELD=video; fi
+          EXTRA=(); [ "$METHOD" = sendVideo ] && EXTRA=(-F supports_streaming=true ${W:+-F width=$W} ${H:+-F height=$H})
+          RES=$(curl -s -X POST "$API/$METHOD" -F "chat_id=$CHAT_ID" -F "caption=$CAP" "${RT[@]}" "${EXTRA[@]}" -F "$FIELD=@$F")
+          echo "$RES" | grep -q '"ok":true' || { echo "Telegram menolak: $(echo "$RES" | head -c 300)"; exit 1; }
